@@ -1,17 +1,24 @@
 #!/bin/bash
 #
-# multi-claude.sh — run multiple Claude Desktop accounts side by side, each as a
-# real, separately-identifiable app with its own Dock tile, name and icon.
+# multi-claude.sh — run multiple Claude accounts side by side: Claude Desktop as
+# real, separately-identifiable apps with their own Dock tile, name and icon, and
+# Claude Code in the terminal via one config directory per profile.
 #
-#   multi-claude.sh <profile>    create or update one instance
-#   multi-claude.sh              update every installed instance (post-upgrade)
-#   multi-claude.sh --update     same as above
-#   multi-claude.sh --list       show installed instances and their freshness
-#   multi-claude.sh --force ...  rebuild even if already current
+#   multi-claude.sh <profile>         create or update one desktop instance
+#   multi-claude.sh                   update every installed instance (post-upgrade)
+#   multi-claude.sh --update          same as above
+#   multi-claude.sh --list            show profiles and their freshness
+#   multi-claude.sh --alias [prof..]  print shell alias lines for the terminal app
+#   multi-claude.sh --force ...       rebuild even if already current
 #
-# Everything but the profile name is derived: the app is "Claude <Profile>" and
-# the icon hue is a stable hash of the profile, so each instance gets its own
-# colour automatically and re-running always reproduces the same one.
+# A profile covers both apps. Everything but the profile name is derived: the app
+# is "Claude <Profile>" and the icon hue is a stable hash of the profile, so each
+# instance gets its own colour automatically and re-running always reproduces the
+# same one. The terminal side needs no clone — Claude Code keeps each account in
+# its own CLAUDE_CONFIG_DIR, so --alias just writes the alias to stdout and you
+# save it wherever you keep aliases:
+#
+#   multi-claude.sh --alias work >> ~/.zshrc
 #
 # Why this clones the whole app rather than making a launcher stub: the Dock
 # tile belongs to the *running* process. A stub that opens /Applications/Claude.app
@@ -24,6 +31,7 @@ SCRIPT_VERSION=1                       # bump to force all instances to rebuild
 SRC_APP="/Applications/Claude.app"
 APPS_DIR="/Applications"
 INSTANCES_ROOT="$HOME/.claude-instances"
+CLI_SUBDIR=cli
 PB=/usr/libexec/PlistBuddy
 
 # Restricted entitlements: these are team-prefixed and cannot be granted by an
@@ -47,6 +55,22 @@ app_name_for()  { # work -> "Claude Work"
 bundle_id_for() { printf 'com.anthropic.claudefordesktop.%s' "$1"; }
 profile_dir_for() { printf '%s/%s' "$INSTANCES_ROOT" "$1"; }
 
+# Claude Code's config dir, kept in a subdirectory because the profile dir root is
+# the desktop instance's Electron user-data-dir.
+cli_config_dir_for() { printf '%s/%s' "$(profile_dir_for "$1")" "$CLI_SUBDIR"; }
+alias_name_for()     { printf 'claude-%s' "$1"; }
+
+# Emitted $HOME-relative so a saved rc file survives a different home directory.
+alias_line_for() {
+  local d; d=$(cli_config_dir_for "$1")
+  printf 'alias %s='"'"'CLAUDE_CONFIG_DIR="%s" claude'"'"'\n' \
+    "$(alias_name_for "$1")" "${d/#$HOME/\$HOME}"
+}
+
+# Lowercase only, so the alias name, the config path and the MCProfile stamp all
+# agree on one spelling (app_name_for still title-cases for the display name).
+valid_profile() { [[ "$1" =~ ^[a-z0-9_-]+$ ]]; }
+
 # Stable hue per profile, in [0.6, 5.7] radians. The range deliberately excludes
 # ~0 so no instance can come out looking like the real Claude.app.
 hue_for() {
@@ -67,6 +91,14 @@ installed_clones() {
     p=$($PB -c "Print :MCProfile" "$app/Contents/Info.plist" 2>/dev/null) || continue
     [ -n "$p" ] && printf '%s\t%s\n' "$p" "$app"
   done
+}
+
+# Every profile this machine knows about: desktop bundles plus any profile
+# directory, so terminal-only profiles are first-class.
+known_profiles() {
+  { installed_clones | cut -f1
+    for d in "$INSTANCES_ROOT"/*/; do [ -d "$d" ] && basename "$d"; done
+  } 2>/dev/null | sort -u
 }
 
 clone_is_current() { # <app_path>
@@ -272,6 +304,7 @@ build_instance() { # <profile>
 
   info "compiling launcher"
   mkdir -p "$profile_dir"; chmod 700 "$profile_dir"
+  mkdir -p "$profile_dir/$CLI_SUBDIR"; chmod 700 "$profile_dir/$CLI_SUBDIR"
   build_shim "$w" "$profile_dir" "$staged/Contents/MacOS/claude-shim"
   $PB -c "Set :CFBundleExecutable claude-shim" "$pl"
 
@@ -304,6 +337,8 @@ build_instance() { # <profile>
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
     -f "$dest" 2>/dev/null || true
   printf '\033[32m  ✓ %s\033[0m  → %s\n' "$name" "$profile_dir"
+  printf '    %s\n' "$(alias_line_for "$profile")"
+  printf '    save it with: %s --alias %s >> ~/.zshrc\n' "$(basename "$0")" "$profile"
 }
 
 # ----------------------------------------------------------------------- main
@@ -315,23 +350,48 @@ for arg in "$@"; do
     --force)      FORCE=1 ;;
     --update)     ;;                       # default behaviour with no profiles
     --list)       MODE=list ;;
-    -h|--help)    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --alias)      MODE="alias" ;;
+    -h|--help)    awk 'NR>1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
     -*)           die "unknown option: $arg" ;;
-    *)            PROFILES+=("$arg") ;;
+    *)            valid_profile "$arg" || die "invalid profile name: $arg (use lowercase letters, digits, - and _)"
+                  PROFILES+=("$arg") ;;
   esac
 done
+
+# --alias is pure output: it must not require Claude.app to be installed, since a
+# profile can be terminal-only.
+if [ "${MODE:-}" = alias ]; then
+  if [ ${#PROFILES[@]} -eq 0 ]; then
+    profiles=$(known_profiles)
+    [ -z "$profiles" ] && die "no profiles yet — run: $(basename "$0") --alias <profile>"
+    while IFS= read -r p; do
+      [ -z "${p:-}" ] && continue
+      alias_line_for "$p"
+    done <<< "$profiles"
+  else
+    for profile in "${PROFILES[@]}"; do alias_line_for "$profile"; done
+  fi
+  exit 0
+fi
 
 [ -d "$SRC_APP" ] || die "$SRC_APP not found"
 mkdir -p "$INSTANCES_ROOT"; chmod 700 "$INSTANCES_ROOT"
 
 if [ "${MODE:-}" = list ]; then
-  printf '%-14s %-26s %-10s %s\n' PROFILE APP STATUS VERSION
-  while IFS=$'\t' read -r p app; do
+  printf '%-14s %-26s %-10s %-6s %s\n' PROFILE APP STATUS CLI VERSION
+  while IFS= read -r p; do
     [ -z "${p:-}" ] && continue
-    v=$($PB -c "Print :MCSourceVersion" "$app/Contents/Info.plist" 2>/dev/null)
-    clone_is_current "$app" && s=current || s=STALE
-    printf '%-14s %-26s %-10s %s\n' "$p" "$(basename "$app")" "$s" "$v"
-  done < <(installed_clones)
+    app="$APPS_DIR/$(app_name_for "$p").app"
+    if [ -d "$app" ]; then
+      v=$($PB -c "Print :MCSourceVersion" "$app/Contents/Info.plist" 2>/dev/null)
+      clone_is_current "$app" && s=current || s=STALE
+      a=$(basename "$app")
+    else
+      a=-; s=-; v=-
+    fi
+    [ -d "$(cli_config_dir_for "$p")" ] && c=yes || c=-
+    printf '%-14s %-26s %-10s %-6s %s\n' "$p" "$a" "$s" "$c" "$v"
+  done < <(known_profiles)
   exit 0
 fi
 
@@ -375,4 +435,11 @@ Notes:
     Claude keys that item to the signing identity, and an ad-hoc signature is
     pinned to the bundle's exact contents, which change when Claude updates.
     Re-running this script on the same Claude version does not re-prompt.
+  * The terminal side is independent of these bundles: nothing is cloned or
+    re-signed, so the aliases keep working across Claude Code upgrades, and a
+    profile can be terminal-only. Print one with:
+
+      multi-claude.sh --alias <profile> >> ~/.zshrc
+
+    The first run of a new alias walks through login for that account.
 NOTE
